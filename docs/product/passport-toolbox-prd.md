@@ -391,7 +391,17 @@ Key hardware constraints. The three buttons share a GPIO0 ADC resistor divider, 
 
 - Business logic: the routine table defines nodes by weekday and odd/even week, each node containing a name, start/end times, and a type (class, break, lunch break, evening study, dismissal, custom). The page locates the current node in real time and computes the remaining time to the next node; node switching can optionally play a tone and show a screen prompt. All computation is done locally on the device.
 - Interaction logic: UP/DOWN scrolls the timeline, OK switches between the today timeline and the week view, and long-press OK goes back. The current node scrolls automatically into view and is highlighted.
-- Rule constraints: nodes are ordered by ascending time and cannot overlap; node names are recommended to stay within 8 Chinese characters, and when they exceed that the font is automatically shrunk to display the full text, without silently truncating user input; two templates, day-student and boarding-student, are provided, and users can add or remove nodes on top of a template; importing structured text on the phone configuration page is supported, validating the time format and overlaps on import.
+- Rule constraints: nodes are ordered by ascending time and cannot overlap; node names are recommended to stay
+       within 8 Chinese characters, and when they exceed that the font is automatically shrunk to show them in full
+       instead of silently truncating user input; two templates (day student / boarding student) are provided and users
+       can add or remove nodes on top of them. Class nodes in the templates are only given the neutral name "Class";
+       no "1st period / 2nd period" numbering is preloaded. On the device, editing a node lets the user cycle through
+       preset names (follow type, Chinese, maths, English, physics, chemistry, biology, information technology, history,
+       geography, politics, science, PE, music, art, self-study, morning reading, class meeting): choosing "follow type"
+       names a new node after its type and keeps the existing name when editing, so a name imported from the phone is
+       never lost by editing the time. The phone configuration page can import arbitrary names as structured text
+       ("08:00-08:45 Chinese"); the import validates the time format and overlaps and infers the node type from the
+       name — preset subject names are classified as "class", so the phone and the device produce the same kind of node.
 - Boundaries and exceptions: when no routine table is defined, the page shows guidance and offers one-tap template application; crossing midnight (for example, evening study until 22:30) is treated as the same day and is not split into two days; when the device time is changed substantially, the countdown follows the current device time and warns that it may be distorted.
 
 #### 6.4.5 Identity and tools (features 12, 13, 14, 15)
