@@ -25,7 +25,7 @@ scrollable, interactive screen prototype ships beside it as
 
 | Area | Highlights |
 | --- | --- |
-| Home | The badge card (animated avatar, nickname, one extra line) above a module carousel of eight entries, with a status bar and a per-page button hint bar. |
+| Home | The badge card and the desk-pet card above a module carousel of eight entries, with a status bar and a per-page button hint bar. |
 | Time and calendar | Gregorian calendar with Chinese lunar date, solar term and daily advice; a five-scale time-progress view (day / week / month / year / life); stopwatch and countdown timer. |
 | Focus and efficiency | Pomodoro timer with configurable focus and break lengths and power-loss-safe records; up to 16 local reminders with weekday repeat. |
 | Routine and countdown | Per-weekday schedule nodes with odd/even week support, current-node highlighting, and a large countdown to the next node. Node names are freely chosen — on the device from a preset subject list, on the phone configuration page as any text. |
@@ -98,7 +98,7 @@ esptool.py --chip esp32c3 -b 460800 --before default_reset --after hard_reset \
 | Firmware build and merged-image verification | PASS |
 | Repository checks and host-side logic tests | PASS |
 | On-device tests | NOT RUN — needs a connected board and approval to flash |
-| Unverified | On-device rendering and CJK glyph coverage, the novel reader's pagination and chapter list on a real screen, novel upload over the device hotspot, the real-world tracker classification hit rate, BLE provisioning end to end, live esports data and its offline fallback, odd/even routine switching after time sync, power behaviour |
+| Unverified | On-device rendering and CJK glyph coverage, the desktop pet's motion feel and status-bar silhouette legibility, the novel reader's pagination and chapter list on a real screen, novel upload over the device hotspot, the real-world tracker classification hit rate, BLE provisioning end to end, live esports data and its offline fallback, odd/even routine switching after time sync, power behaviour |
 
 `dist/` is a delivery snapshot: rerunning the firmware gate refreshes `build/`
 only, so refresh `dist/` and its checksum deliberately. Light sleep and deep
