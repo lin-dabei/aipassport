@@ -22,7 +22,6 @@
 
 #include "ui_pages.h"
 
-#include "ui_pet.h"
 #include "ui_theme.h"
 
 #include "net/app_ble.h"
@@ -78,7 +77,6 @@ static struct {
 
     uint8_t  track_addr[6];   // 追踪屏正在看的设备
     bool     track_alerted;   // 追踪屏：本轮"在远离"是否已提醒过，避免每帧刷屏
-    bool     pet_tracker_done; // 本次进页是否已经为"追踪到防丢器"让桌宠反应过
     lv_obj_t *t_pct;
     lv_obj_t *t_level;
     lv_obj_t *t_bar;
@@ -419,12 +417,6 @@ static void build_track(void)
 
     // 已归为追踪器（防丢器）的设备额外说明：这正是用户拿它找 AirTag/防丢器的场景。
     bool is_tracker = (ti >= 0 && s.entries[ti].category == APP_FINDER_CAT_TRACKER);
-    // 桌宠反应：首次追踪到防丢器时惊讶一下，坐实"这确实是一台防丢器"。每次进页只反应
-    // 一次，免得在列表里来回切设备时反复触发。
-    if (is_tracker && !s.pet_tracker_done) {
-        s.pet_tracker_done = true;
-        ui_pet_event(APP_PET_EV_TRACKER);
-    }
     ui_banner_create(c, is_tracker
                             ? "像防丢器：走近信号变强，趋势会显示在档位后面"
                             : "边走边看百分比：越接近 100% 说明越近",
@@ -461,8 +453,6 @@ static void toggle_save(const uint8_t addr[6])
             return;
         }
         ui_hint_flash("已存为我的设备", 1400);
-        // 桌宠为"把自己的设备收进收藏"高兴一下，和防丢器被追踪到时的惊讶区分开。
-        ui_pet_event(APP_PET_EV_FOUND_DEVICE);
     }
     refresh();   // 立刻重排：收藏项要挪进"我的设备"区，用户马上看到结果
 }
