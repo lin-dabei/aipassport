@@ -10,6 +10,8 @@
 // 但标记为未同步，直到 NTP 或手机/手动再次校准，避免把过期时间伪装成已同步。
 // 重启后的误差等于"上次落盘到断电"的时长，所以运行期由 ui_app 的 1 秒节拍每分钟调用
 // app_state_save_clock() 落盘一次，把误差压到一分钟以内；联网时开机还会自动校时一次。
+// 每次校准都会同时写入 newlib 系统时钟：HTTPS/TLS 的证书有效期校验读的是 time(NULL)，
+// 只写 epoch_base 只能让界面时间变对，联网请求仍会因"证书尚未生效"失败。
 //
 // 密钥约定：动态口令的密钥必须在开机后自动可用（用户不可能每次开机先解一次锁），
 // 因此不能像密码本那样用口令加密，只能用"设备绑定"：eFuse MAC 与本机随机种子一起喂进
@@ -33,6 +35,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 static const char *TAG = "app_state";
 
@@ -505,6 +508,13 @@ void app_state_set_time(const app_datetime_t *dt, const char *source)
     strncpy(s.settings.time_source, source ? source : "手动",
             sizeof(s.settings.time_source) - 1);
     s.settings.time_source[sizeof(s.settings.time_source) - 1] = '\0';
+
+    // 同时写入 newlib 系统时钟。TLS 证书校验（mbedTLS 的 notBefore/notAfter 检查）读的是
+    // time(NULL)：设备没有 RTC，重启后它是 1970，若只记 epoch_base，界面时间是对的，但
+    // 所有 HTTPS 请求都会以"证书尚未生效"失败。三个校准入口（NTP / 手机 / 手动）都经过
+    // 这里，因此在这一处兜住即可。
+    struct timeval tv = { .tv_sec = (time_t)unix_utc, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
 
     app_state_save_clock();
     app_state_save_settings();

