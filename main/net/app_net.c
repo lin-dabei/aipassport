@@ -13,6 +13,7 @@
 #include "app_assets.h"
 #include "app_ble.h"
 #include "app_metrics.h"
+#include "app_novel.h"
 #include "app_state.h"
 #include "logic/app_anim.h"
 #include "logic/app_badge.h"
@@ -1899,6 +1900,21 @@ static const char PROV_PAGE[] =
     "</form>\n"
     "<div id=\"animList\" class=\"st\"></div>\n"
 
+    "<form id=\"nf\">\n"
+    "<h2>小说</h2>\n"
+    "<label>书名（最多 8 个字；留空则用文件名）</label>"
+    "<input id=\"ntitle\" maxlength=\"24\" placeholder=\"小说名\">\n"
+    "<label>选择 TXT 文件（UTF-8 编码）</label>"
+    "<input type=\"file\" id=\"nfile\" accept=\".txt,text/plain\">\n"
+    "<label>或直接粘贴正文</label>"
+    "<textarea id=\"ntext\" rows=\"4\" placeholder=\"也可以把正文粘贴到这里\"></textarea>\n"
+    "<button type=\"button\" onclick=\"uploadNovel()\">上传到设备</button>\n"
+    "<p class=\"st\" id=\"nst\">上传会覆盖设备里已有的那本，阅读进度从头开始。"
+    "正文必须是 UTF-8 文本；单本上限约 1MB。上传时设备在写 Flash，请不要离开本页面。</p>\n"
+    "</form>\n"
+    "<div id=\"novelInfo\" class=\"st\"></div>\n"
+    "<form method=\"post\" action=\"/novel_del\"><button type=\"submit\">删除设备上的小说</button></form>\n"
+
     "<script>\n"
     "document.getElementById('t').value=Math.floor(Date.now()/1000);\n"
     "var ESC={'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'};\n"
@@ -1933,6 +1949,10 @@ static const char PROV_PAGE[] =
     "      al+='<div class=\"item\"><span>槽位 '+s.slot+(s.used?('：'+esc(s.name||'未命名')+' '+s.w+'x'+s.h+' · '+s.frames+' 帧'):'：空')+'</span></div>';\n"
     "    }\n"
     "    document.getElementById('animList').innerHTML='动图槽位：'+d.anim.used+' / '+d.anim.slots+(al?'<div>'+al+'</div>':'');\n"
+    "    var nv=d.novel||{};\n"
+    "    document.getElementById('novelInfo').innerHTML = nv.present\n"
+    "      ? ('设备里已有：《'+esc(nv.title||'未命名')+'》，约 '+Math.round((nv.bytes||0)/1024)+' KB'+(nv.chapters?('，'+nv.chapters+' 章'):'，没有章节标记'))\n"
+    "      : '设备里还没有小说。上传后即可离线阅读。';\n"
     "  }).catch(function(){document.getElementById('ast').textContent='读取设备数据失败，请刷新页面重试';});\n"
     "}\n"
     "function frame565(src,W,H){\n"
@@ -1999,6 +2019,29 @@ static const char PROV_PAGE[] =
     "    xhr.onerror=function(){st.textContent='上传中断，请重试';};\n"
     "    xhr.send(all.buffer);\n"
     "  }).catch(function(e){st.textContent='解码失败：'+(e&&e.message?e.message:'未知原因');});\n"
+    "}\n"
+    "function uploadNovel(){\n"
+    "  var st=document.getElementById('nst');\n"
+    "  var title=document.getElementById('ntitle').value||'';\n"
+    "  var f=document.getElementById('nfile').files[0];\n"
+    "  var ta=document.getElementById('ntext').value;\n"
+    "  function send(text,name){\n"
+    "    if(!text){st.textContent='没有可上传的正文';return;}\n"
+    "    if(!title&&name){title=String(name).replace(/\\.[^.]+$/,'').slice(0,24);}\n"
+    "    var xhr=new XMLHttpRequest();\n"
+    "    xhr.open('POST','/novel?title='+encodeURIComponent(title));\n"
+    "    xhr.setRequestHeader('Content-Type','text/plain;charset=utf-8');\n"
+    "    xhr.upload.onprogress=function(e){if(e.total){st.textContent='上传中 '+Math.round(e.loaded/e.total*100)+'%';\n"
+    "      if(e.loaded>=e.total)st.textContent='上传完成，设备正在校验（可能要十几秒）';}};\n"
+    "    xhr.onload=function(){\n"
+    "      if(xhr.status>=200&&xhr.status<300){st.textContent='已保存 '+text.length+' 字符';loadInfo();}\n"
+    "      else{st.textContent='设备拒绝（状态 '+xhr.status+'）：正文过长或不是 UTF-8 文本';}\n"
+    "    };\n"
+    "    xhr.onerror=function(){st.textContent='上传中断，请重试';};\n"
+    "    xhr.send(text);\n"
+    "  }\n"
+    "  if(f){var fr=new FileReader();fr.onload=function(){send(String(fr.result),f.name);};fr.readAsText(f,'utf-8');}\n"
+    "  else send(ta,'');\n"
     "}\n"
     "window.addEventListener('load',loadInfo);\n"
     "</script>\n"
@@ -2682,6 +2725,94 @@ static esp_err_t prov_post_anim(httpd_req_t *req)
     return prov_reply(req, msg);
 }
 
+// ---------------------------------------------------------------------------
+// 小说：上传 / 删除
+// ---------------------------------------------------------------------------
+// 正文可能接近 1MB，若走表单编码会被膨胀成两三倍，因此约定"正文走请求体原文
+// （text/plain），书名走查询参数"。设备端边收边写闪存，不把整本书放进内存。
+
+static esp_err_t prov_post_novel(httpd_req_t *req)
+{
+    if (!app_novel_ready()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return prov_reply(req, "小说分区不可用，无法保存");
+    }
+
+    int total = req->content_len;
+    if (total <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return prov_reply(req, "没有收到正文");
+    }
+    if ((uint32_t)total > app_novel_capacity()) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "正文 %d 字节，超过设备上限 %u 字节（约 %u KB）",
+                 total, (unsigned)app_novel_capacity(),
+                 (unsigned)(app_novel_capacity() / 1024));
+        return prov_reply(req, msg);
+    }
+
+    char title[64] = { 0 };
+    char query[256];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[128];
+        if (httpd_query_key_value(query, "title", val, sizeof(val)) == ESP_OK) {
+            url_decode(val);
+            copy_trunc(title, sizeof(title), val);
+        }
+    }
+
+    app_novel_writer_t writer;
+    esp_err_t err = app_novel_write_begin(&writer, title, (uint32_t)total);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return prov_reply(req, "无法开始写入：容量或书名不合法");
+    }
+
+    // 一次 2KB：与动图上传一致，既够快也不会顶到 httpd 任务的栈。
+    char *chunk = (char *)malloc(2048);
+    if (!chunk) {
+        app_novel_write_abort(&writer);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return prov_reply(req, "设备内存不足，请重试");
+    }
+
+    int got = 0;
+    while (got < total) {
+        int r = httpd_req_recv(req, chunk, 2048);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0 || app_novel_write_chunk(&writer, chunk, (size_t)r) != ESP_OK) {
+            free(chunk);
+            app_novel_write_abort(&writer);
+            httpd_resp_set_status(req, "400 Bad Request");
+            return prov_reply(req, "上传中断或正文不是合法 UTF-8，已放弃（原小说已被清除）");
+        }
+        got += r;
+    }
+    free(chunk);
+
+    if (app_novel_write_commit(&writer) != ESP_OK) {
+        return prov_reply(req, "写入校验失败，请重新上传");
+    }
+
+    char msg[160];
+    snprintf(msg, sizeof(msg), "小说已保存：%s（%d KB，%d 章）",
+             title[0] ? title : "(未命名)", (total + 512) / 1024,
+             app_novel_chapter_count());
+    prov_set_note("小说已更新");
+    return prov_reply(req, msg);
+}
+
+static esp_err_t prov_post_novel_del(httpd_req_t *req)
+{
+    if (app_novel_erase() != ESP_OK) {
+        return prov_reply(req, "删除失败，请重试");
+    }
+    app_state_set_novel_pos(0, 0);
+    prov_set_note("小说已删除");
+    return prov_reply(req, "小说已删除");
+}
+
 // 页面初始化时一次性取回设备端状态：动图槽位、密码本摘要、口令账户、番茄钟参数与
 // 统计。密码本只给"名称 + 账号"、口令只给备注名——网页不是查看口令的地方，这样手机
 // 被别人拿到也看不到敏感内容。
@@ -2776,6 +2907,17 @@ static esp_err_t prov_get_info(httpd_req_t *req)
              p->total_focus_sessions, p->total_focus_minutes);
     buf_append(buf, cap, &used, tmp);
     json_append_str(buf, cap, &used, app_pomodoro_state_name(p->state));
+    buf_append(buf, cap, &used, "},");
+
+    buf_append(buf, cap, &used, "\"novel\":{\"present\":");
+    buf_append(buf, cap, &used, app_novel_present() ? "true" : "false");
+    app_novel_header_t novel_hdr;
+    if (app_novel_header(&novel_hdr) == ESP_OK) {
+        snprintf(tmp, sizeof(tmp), ",\"bytes\":%u,\"chapters\":%u,\"title\":",
+                 (unsigned)novel_hdr.data_bytes, (unsigned)novel_hdr.chapter_count);
+        buf_append(buf, cap, &used, tmp);
+        json_append_str(buf, cap, &used, novel_hdr.title);
+    }
     buf_append(buf, cap, &used, "},");
 
     snprintf(tmp, sizeof(tmp), "\"badge\":{\"count\":%d,\"selected\":%d}}",
@@ -2953,6 +3095,8 @@ esp_err_t app_net_prov_start(void)
         { .uri = "/vcard",      .method = HTTP_POST, .handler = prov_post_vcard,      .user_ctx = NULL },
         { .uri = "/pomo",       .method = HTTP_POST, .handler = prov_post_pomo,       .user_ctx = NULL },
         { .uri = "/anim",       .method = HTTP_POST, .handler = prov_post_anim,       .user_ctx = NULL },
+        { .uri = "/novel",      .method = HTTP_POST, .handler = prov_post_novel,      .user_ctx = NULL },
+        { .uri = "/novel_del",  .method = HTTP_POST, .handler = prov_post_novel_del,  .user_ctx = NULL },
     };
     const size_t uri_n = sizeof(uris) / sizeof(uris[0]);
     // max_uri_handlers 必须真的够用：注册失败的 URI 在手机上就是 404，而 UI 不会报错。

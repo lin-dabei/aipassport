@@ -95,6 +95,11 @@ typedef struct {
     char            ssid[33];
     int             battery;
 
+    // 小说阅读进度：正文里的字节偏移 + 那本书的 data_crc。绑定 CRC 是为了让"换了书"
+    // 自动从头开始，而不是拿着旧偏移切到新正文中间。
+    uint32_t novel_offset;
+    uint32_t novel_crc;
+
     int64_t epoch_base;   // uptime 为 0 时对应的 Unix 秒
     bool    loaded;
 } app_runtime_t;
@@ -380,6 +385,8 @@ static void runtime_defaults(void)
     s.net = APP_NET_OFF;
     s.ssid[0] = '\0';
     s.battery = -1;
+    s.novel_offset = 0;
+    s.novel_crc = 0;
     s.epoch_base = DEFAULT_EPOCH;
 }
 
@@ -434,6 +441,17 @@ esp_err_t app_state_init(void)
             memset(&s.esports, 0, sizeof(s.esports));
         }
         totp_load();
+
+        // 小说阅读进度。与书的 CRC 一起读出来：换了书就该从头开始。
+        struct {
+            uint32_t offset;
+            uint32_t crc;
+        } novel_pos = { 0, 0 };
+        if (blob_load("novelpos", &novel_pos, sizeof(novel_pos), &got) == ESP_OK &&
+            got == sizeof(novel_pos)) {
+            s.novel_offset = novel_pos.offset;
+            s.novel_crc = novel_pos.crc;
+        }
 
         // 密码本：容器长度可变，按记录的长度读出来再解析。解析失败会被重置成空本，
         // 因此损坏或旧版本的字节不会留下半个可用的密码本。
@@ -643,6 +661,23 @@ void app_state_save_routine(void)  { blob_save("routine", &s.routine, sizeof(s.r
 void app_state_save_reminders(void){ blob_save("reminders", &s.reminders, sizeof(s.reminders)); }
 void app_state_save_pomodoro(void) { blob_save("pomodoro", &s.pomodoro, sizeof(s.pomodoro)); }
 void app_state_save_esports(void)  { blob_save("esports", &s.esports, sizeof(s.esports)); }
+
+// 小说阅读进度：8 字节的独立 blob。翻页会频繁更新，放在 NVS（有磨损均衡）而不是
+// 反复擦写 novel 分区。
+uint32_t app_state_novel_offset(void) { return s.novel_offset; }
+uint32_t app_state_novel_crc(void)    { return s.novel_crc; }
+
+void app_state_set_novel_pos(uint32_t offset, uint32_t data_crc)
+{
+    s.novel_offset = offset;
+    s.novel_crc = data_crc;
+
+    struct {
+        uint32_t offset;
+        uint32_t crc;
+    } pos = { offset, data_crc };
+    blob_save("novelpos", &pos, sizeof(pos));
+}
 
 // 动态口令的落盘必须整体重排（密钥要逐条密封），因此不直接 dump 内存结构，而是先
 // 组装密封容器再写。缓冲从堆上取：容器约 1.8KB，压在任务栈上不划算。
